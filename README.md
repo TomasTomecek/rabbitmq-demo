@@ -55,3 +55,10 @@ $ ./consume_and_ack.py
 ```
 
 Nothing new in the queue, nothing received.
+
+
+# Resources
+
+ * https://www.rabbitmq.com/tutorials/tutorial-two-python.html
+ * http://www.rabbitmq.com/confirms.html
+
