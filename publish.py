@@ -46,8 +46,6 @@ def on_delivery_confirmation(frame):
 
 
 connection = pika.SelectConnection(pika.ConnectionParameters('localhost'), on_open_callback=on_open)
-#x = connection.channel()
-#x.basic_publish
 try:
     connection.ioloop.start()
 except KeyboardInterrupt:
