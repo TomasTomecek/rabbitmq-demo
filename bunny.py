@@ -1,8 +1,12 @@
 """
 TODO:
  * allow receiving messages in threads
+ * allow adding callback when message is received
 """
+from copy import deepcopy
+import json
 import logging
+
 import pika
 
 
@@ -32,46 +36,65 @@ class Bunny(object):
         self.connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
         self.channel = self.connection.channel()
         logger.info("connection is opened")
+
+        self.channel.confirm_delivery()
         self.channel.exchange_declare(exchange=EXCHANGE, type='topic', durable=True)
         logger.info("exchange %s declared", EXCHANGE)
 
     def register_service(self, name):
-        result = self.channel.queue_declare(durable=True)
-        queue_name = result.method.queue
+        result = self.channel.queue_declare(queue=name, durable=True)
         routing_key = "{0}.#".format(name)
-        self.channel.queue_bind(queue_name, EXCHANGE, routing_key=routing_key)
-        logger.info("bind created: %s -(%s)-> %s", EXCHANGE, routing_key, queue_name)
+        self.channel.queue_bind(name, EXCHANGE, routing_key=routing_key)
+        logger.info("bind created: %s -(%s)-> %s", EXCHANGE, routing_key, name)
 
-    def send(self, text, routing_key):
-        self.channel.publish(EXCHANGE, routing_key, text,
-                             pika.BasicProperties(content_type='text/plain',
-                                                  delivery_mode=1))
+    def send(self, data, routing_key):
+        encoded_data = json.dumps(data)
+        logger.debug("[%s] send %s", routing_key, encoded_data)
+        self.channel.publish(EXCHANGE, routing_key, encoded_data,
+                             pika.BasicProperties(content_type='application/json',
+                                                  delivery_mode=2))
 
-    def receive(self, routing_key, callback):
-        self.channel.basic_consume(callback,
-                              queue='hello',
-                              no_ack=False)
+    def receive_stream(self, routing_key, ack=True):
+        for method, properties, body in self.channel.consume(
+            queue=routing_key,
+            no_ack=False
+        ):
+            redelivered = method.redelivered
+            routing_key = method.routing_key
+            delivery_tag = method.delivery_tag
+            logger.debug("%d [%s] -> %s%s",
+                         delivery_tag,
+                         routing_key,
+                         body,
+                         " (redelivered!)" if redelivered else "")
+            if ack:
+                logger.debug("message %d acked", delivery_tag)
+                self.channel.basic_ack(method.delivery_tag)
+            yield json.loads(body)
 
-        self.channel.start_consuming()
-
-    def receive_stream(self, routing_key):
-        # FIXME
-        self.channel.basic_consume(callback,
-                                   queue='hello',
-                                   no_ack=False)
-
-        self.channel.start_consuming()
+    def close(self):
+        self.channel.close()
+        self.connection.close()
 
 
 class UpstreamReleaseMonitoring(object):
     """ messaging for URM """
 
+    SERVICE_NAME = "urm"
+    TEMPLATE = {
+        "name": None,
+        "version": None,
+    }
+
     def __init__(self):
         self.b = Bunny()
-        self.b.register_service("urm")
+        self.b.register_service(self.SERVICE_NAME)
 
-    def new_release(self):
-        pass
+    def new_release(self, package_name, release):
+        data = deepcopy(self.TEMPLATE)
+        data["name"] = package_name
+        data["version"] = release
+        self.b.send(data, self.SERVICE_NAME + ".release.new")
 
-    def fetch_releases(self):
-        pass
+    def fetch_releases(self, ack=True):
+        return self.b.receive_stream(self.SERVICE_NAME, ack=ack)
