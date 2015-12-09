@@ -1,17 +1,19 @@
 """
 TODO:
- * allow receiving messages in threads
- * allow adding callback when message is received
 """
+from __future__ import print_function
+
 from copy import deepcopy
 import json
 import logging
 
-import pika
+from proton import Message
+from proton.handlers import MessagingHandler
+from proton.reactor import Container
 
 
 # create logger
-logger = logging.getLogger("bunny")
+logger = logging.getLogger("m")
 logger.handlers = []
 logger.setLevel(logging.DEBUG)
 # create console handler and set level to debug
@@ -25,57 +27,59 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-EXCHANGE = "ccs"
+class Base(object):
+    def __init__(self, server, address):
+        self.server = "ssl://messaging-devops-broker01.dev1.ext.devlab.redhat.com:5671"
+        self.address = address
+        logger.debug("initialized")
 
 
-class Bunny(object):
-    """ message bus wrapper """
+class Receiver(Base, MessagingHandler):
+    """ receive messages """
 
-    def __init__(self):
+    def __init__(self, server, address, callback):
+        logger.debug("starting initialization")
+        self.callback = callback
+        Base.__init__(self, server, address)
+        MessagingHandler.__init__(self)
+
+    def on_start(self, event):
         logger.debug("opening connection")
-        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
-        self.channel = self.connection.channel()
-        logger.info("connection is opened")
+        conn = event.container.connect(self.server)
+        event.container.create_receiver(conn, self.address)
 
-        self.channel.confirm_delivery()
-        self.channel.exchange_declare(exchange=EXCHANGE, type='topic', durable=True)
-        logger.info("exchange %s declared", EXCHANGE)
+    def on_message(self, event):
+        self.callback(json.loads(event.message.body))
+        event.connection.close()
 
-    def register_service(self, name):
-        result = self.channel.queue_declare(queue=name, durable=True)
-        routing_key = "{0}.#".format(name)
-        self.channel.queue_bind(name, EXCHANGE, routing_key=routing_key)
-        logger.info("bind created: %s -(%s)-> %s", EXCHANGE, routing_key, name)
 
-    def send(self, data, routing_key):
-        encoded_data = json.dumps(data)
-        logger.debug("[%s] send %s", routing_key, encoded_data)
-        self.channel.publish(EXCHANGE, routing_key, encoded_data,
-                             pika.BasicProperties(content_type='application/json',
-                                                  delivery_mode=2))
+class Sender(Base, MessagingHandler):
+    """ send messages """
 
-    def receive_stream(self, routing_key, ack=True):
-        for method, properties, body in self.channel.consume(
-            queue=routing_key,
-            no_ack=False
-        ):
-            redelivered = method.redelivered
-            routing_key = method.routing_key
-            delivery_tag = method.delivery_tag
-            logger.debug("%d [%s] -> %s%s",
-                         delivery_tag,
-                         routing_key,
-                         body,
-                         " (redelivered!)" if redelivered else "")
-            if ack:
-                logger.debug("message %d acked", delivery_tag)
-                self.channel.basic_ack(method.delivery_tag)
-            yield json.loads(body)
+    def __init__(self, server, address, messages):
+        logger.debug("starting initialization")
+        self.messages = messages
+        Base.__init__(self, server, address)
+        MessagingHandler.__init__(self)
+        logger.debug("initialized")
 
-    def close(self):
-        self.channel.close()
-        self.connection.close()
+    def on_start(self, event):
+        logger.debug("opening connection")
+        conn = event.container.connect(self.server)
+        event.container.create_sender(conn, self.address)
 
+    def on_sendable(self, event):
+        for message in self.messages:
+            message = json.dumps(message)
+            event.sender.send(Message(body=message))
+        event.sender.close()
+
+
+def send_messages(address, messages):
+    Container(Sender("not-used", address, messages)).run()
+
+def receive_messages(address, callback):
+    Container(Sender("not-used", address, callback)).run()
 
 class UpstreamReleaseMonitoring(object):
     """ messaging for URM """
@@ -86,15 +90,16 @@ class UpstreamReleaseMonitoring(object):
         "version": None,
     }
 
-    def __init__(self):
-        self.b = Bunny()
-        self.b.register_service(self.SERVICE_NAME)
-
     def new_release(self, package_name, release):
         data = deepcopy(self.TEMPLATE)
         data["name"] = package_name
         data["version"] = release
-        self.b.send(data, self.SERVICE_NAME + ".release.new")
+        address = self.SERVICE_NAME + ".release.new"
+        send_messages(address, [data])
 
     def fetch_releases(self, ack=True):
-        return self.b.receive_stream(self.SERVICE_NAME, ack=ack)
+        def c(m):
+            print(m)
+        address = self.SERVICE_NAME + ".release.new"
+        receive_messages(address, c)
+
